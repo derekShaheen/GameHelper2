@@ -10,6 +10,7 @@ namespace GameHelper.Plugin
     using System.Linq;
     using System.Reflection;
     using System.Threading.Tasks;
+    using System.IO.Compression; // added for zip extraction
     using Coroutine;
     using CoroutineEvents;
     using CTOUtils = ClickableTransparentOverlay.Win32.Utils;
@@ -38,6 +39,10 @@ namespace GameHelper.Plugin
         internal static void InitializePlugins()
         {
             State.PluginsDirectory.Create(); // doesn't do anything if already exists.
+
+            // Expand any .zip files dropped in the Plugins folder before scanning directories.
+            ExtractZipPluginsIfAny();
+
             LoadPluginMetadata(LoadPlugins());
 #if DEBUG
             GetAllPluginNames();
@@ -47,6 +52,134 @@ namespace GameHelper.Plugin
             CoroutineHandler.Start(SavePluginMetadataCoroutine());
             Core.CoroutinesRegistrar.Add(CoroutineHandler.Start(
                 DrawPluginUiRenderCoroutine(), "[PManager] Draw Plugins UI"));
+        }
+
+        /// <summary>
+        /// Extract any non-hidden *.zip files in the Plugins directory.
+        /// Destination folder name is taken from the plugin DLL file name (without extension).
+        /// If the ZIP already contains a single top-level folder, we avoid nesting by moving that folder.
+        /// Ensures the DLL exists at the destination folder root so ReadPluginFiles can find it.
+        /// Deletes the ZIP after a successful extraction.
+        /// </summary>
+        private static void ExtractZipPluginsIfAny()
+        {
+            try
+            {
+                var zips = State.PluginsDirectory
+                    .GetFiles("*.zip", SearchOption.TopDirectoryOnly)
+                    .Where(f => (f.Attributes & FileAttributes.Hidden) == 0)
+                    .ToList();
+
+                foreach (var zip in zips)
+                {
+                    string tempDir = null;
+                    try
+                    {
+                        tempDir = Path.Combine(State.PluginsDirectory.FullName, Guid.NewGuid().ToString("N"));
+                        Directory.CreateDirectory(tempDir);
+
+                        // Extract into a temporary folder
+                        ZipFile.ExtractToDirectory(zip.FullName, tempDir, overwriteFiles: true);
+
+                        // Detect if archive has a single root directory (no files at temp root, exactly one directory)
+                        var topFiles = Directory.GetFiles(tempDir, "*", SearchOption.TopDirectoryOnly);
+                        var topDirs = Directory.GetDirectories(tempDir, "*", SearchOption.TopDirectoryOnly);
+
+                        // If there is exactly one top-level folder and no top-level files, use that as content root
+                        var contentRoot = (topFiles.Length == 0 && topDirs.Length == 1) ? topDirs[0] : tempDir;
+
+                        // Find the plugin dll anywhere under the content root
+                        var dllPath = Directory
+                            .EnumerateFiles(contentRoot, "*.dll", SearchOption.AllDirectories)
+                            .FirstOrDefault();
+
+                        if (dllPath == null)
+                        {
+                            Console.WriteLine($"[PManager] No dll found in '{zip.Name}', skipping.");
+                            Directory.Delete(tempDir, true);
+                            continue;
+                        }
+
+                        // Ensure the DLL is present at the root of the contentRoot (so after move, it is at finalDir root).
+                        // If it's nested, copy it up to the contentRoot.
+                        var dllRel = Path.GetRelativePath(contentRoot, dllPath);
+                        var dllRelDir = Path.GetDirectoryName(dllRel);
+                        if (!string.IsNullOrEmpty(dllRelDir))
+                        {
+                            var dllAtRoot = Path.Combine(contentRoot, Path.GetFileName(dllPath));
+                            try
+                            {
+                                File.Copy(dllPath, dllAtRoot, overwrite: true);
+                                dllPath = dllAtRoot; // update reference to the top-level copy
+                            }
+                            catch (Exception copyEx)
+                            {
+                                Console.WriteLine($"[PManager] Failed to copy DLL to root for '{zip.Name}': {copyEx}");
+                            }
+                        }
+
+                        // Final folder name comes from the dll's file name (minus extension)
+                        var dllBaseName = Path.GetFileNameWithoutExtension(dllPath);
+                        var finalDir = Path.Combine(State.PluginsDirectory.FullName, dllBaseName);
+
+                        // If the destination already exists, remove it to avoid nesting/merge issues
+                        if (Directory.Exists(finalDir))
+                        {
+                            try
+                            {
+                                Directory.Delete(finalDir, true);
+                            }
+                            catch (Exception delEx)
+                            {
+                                Console.WriteLine($"[PManager] Failed clearing existing folder '{finalDir}': {delEx}");
+                                // If we can't clear, skip to next zip to avoid undefined state
+                                Directory.Delete(tempDir, true);
+                                continue;
+                            }
+                        }
+
+                        // Move the content root into place:
+                        //   - If contentRoot == tempDir, this is the whole extracted set (no single root folder)
+                        //   - If contentRoot is the single root folder, move just that folder (prevents extra nesting)
+                        if (string.Equals(contentRoot, tempDir, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Directory.Move(tempDir, finalDir);
+                        }
+                        else
+                        {
+                            Directory.Move(contentRoot, finalDir);
+                            // Clean up the now-empty tempDir that still exists alongside
+                            if (Directory.Exists(tempDir))
+                            {
+                                Directory.Delete(tempDir, true);
+                            }
+                        }
+
+                        // Remove the zip after successful extraction/placement
+                        zip.Delete();
+
+                        Console.WriteLine($"[PManager] Extracted '{zip.Name}' to '{finalDir}' and removed the archive.");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[PManager] Failed to extract '{zip.FullName}': {ex}");
+                        // Best-effort cleanup
+                        try
+                        {
+                            if (!string.IsNullOrWhiteSpace(tempDir) && Directory.Exists(tempDir))
+                                Directory.Delete(tempDir, true);
+                        }
+                        catch
+                        {
+                            // ignore cleanup errors
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[PManager] ZIP scan failed: {ex}");
+            }
         }
 
         private static List<PluginWithName> LoadPlugins()
@@ -144,7 +277,6 @@ namespace GameHelper.Plugin
                 return null;
             }
         }
-
 
         private static PluginWithName LoadPlugin(DirectoryInfo pluginDirectory)
         {
