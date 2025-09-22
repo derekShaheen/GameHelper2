@@ -44,8 +44,16 @@ namespace GameHelper.Plugin
             // Expand any .zip files dropped in the Plugins folder before scanning directories.
             ExtractZipPluginsIfAny();
 
-            // NEW: Build existing plugin folders that have a project/solution but no top-level dll matching the folder name.
-            EnsureBuiltPluginsInPlace();
+            // Respect the new setting: rebuild everything, otherwise only build if missing DLL.
+            if (Core.GHSettings.AlwaysRebuildPlugins)
+            {
+                Console.WriteLine($"[PManager] AlwaysRebuildProject is enabled; rebuilding all plugin projects.");
+                ForceRebuildAllProjects();
+            }
+            else
+            {
+                EnsureBuiltPluginsInPlace();
+            }
 
             LoadPluginMetadata(LoadPlugins());
 #if DEBUG
@@ -321,6 +329,73 @@ namespace GameHelper.Plugin
             {
                 Console.WriteLine($"[PManager] TryBuildIfProject error: {ex}");
                 return null;
+            }
+        }
+
+        /// <summary>
+        /// When AlwaysRebuildProject = true:
+        /// For each plugin folder:
+        ///   - If any .sln exists, build solutions only (do not build projects).
+        ///   - Else if no .sln but .csproj exists, build projects only.
+        ///   - After building, ensure a DLL is at the folder root and that {Folder}.dll exists.
+        /// </summary>
+        private static void ForceRebuildAllProjects()
+        {
+            try
+            {
+                var dirs = GetPluginsDirectories();
+                foreach (var dir in dirs)
+                {
+                    try
+                    {
+                        var slns = Directory.GetFiles(dir.FullName, "*.sln", SearchOption.AllDirectories);
+                        var csprojs = Directory.GetFiles(dir.FullName, "*.csproj", SearchOption.AllDirectories);
+
+                        if (slns.Length > 0)
+                        {
+                            // Build solutions only for this directory
+                            foreach (var sln in slns)
+                            {
+                                //Console.WriteLine($"[PManager] Rebuilding solution '{sln}' (AlwaysRebuildProject)...");
+                                var _ = TryBuildIfProject(dir.FullName, Path.GetFileNameWithoutExtension(sln));
+                            }
+                        }
+                        else if (csprojs.Length > 0)
+                        {
+                            // No solutions; build projects only for this directory
+                            foreach (var proj in csprojs)
+                            {
+                                //Console.WriteLine($"[PManager] Rebuilding project '{proj}' (AlwaysRebuildProject)...");
+                                var _ = TryBuildIfProject(dir.FullName, Path.GetFileNameWithoutExtension(proj));
+                            }
+                        }
+                        else
+                        {
+                            // Nothing to build in this directory
+                        }
+
+                        // Prefer a DLL matching the folder name; else pick newest found in tree
+                        var preferred = PickDllBySimilarity(dir.FullName, dir.Name);
+                        if (preferred != null)
+                        {
+                            // Ensure it’s at the folder root
+                            var dllAtRoot = EnsureDllAtRoot(dir.FullName, preferred);
+                        }
+
+                        // Ensure a DLL named exactly {Folder}.dll exists at the root
+                        EnsureDllNamedAfterFolder(dir.FullName);
+
+                        //Console.WriteLine($"[PManager] Force rebuilt and prepared plugin '{dir.Name}'.");
+                    }
+                    catch (Exception exInner)
+                    {
+                        Console.WriteLine($"[PManager] ForceRebuildAllProjects error for '{dir.FullName}': {exInner}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[PManager] ForceRebuildAllProjects failed: {ex}");
             }
         }
 
